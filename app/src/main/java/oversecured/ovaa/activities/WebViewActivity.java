@@ -24,6 +24,6 @@ public class WebViewActivity extends AppCompatActivity {
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient());
         webView.getSettings().setJavaScriptEnabled(true);
-        webView.getSettings().setAllowFileAccessFromFileURLs(true);
+        webView.getSettings().setAllowFileAccessFromFileURLs(false);
     }
 }
