@@ -11,6 +11,7 @@ import androidx.annotation.NonNull;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.IOException;
 
 public class TheftOverwriteProvider extends ContentProvider {
     @Override
@@ -45,7 +46,20 @@ public class TheftOverwriteProvider extends ContentProvider {
 
     @Override
     public ParcelFileDescriptor openFile(@NonNull Uri uri, @NonNull String mode) throws FileNotFoundException {
-        File file = new File(Environment.getExternalStorageDirectory(), uri.getLastPathSegment());
-        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_WRITE);
+        File baseDir = Environment.getExternalStorageDirectory();
+        File file = new File(baseDir, uri.getLastPathSegment());
+        String baseCanonicalPath;
+        String fileCanonicalPath;
+        try {
+            baseCanonicalPath = baseDir.getCanonicalPath();
+            fileCanonicalPath = file.getCanonicalPath();
+        } catch (IOException e) {
+            throw new FileNotFoundException(e.getMessage());
+        }
+        if (!fileCanonicalPath.equals(baseCanonicalPath)
+                && !fileCanonicalPath.startsWith(baseCanonicalPath + File.separator)) {
+            throw new FileNotFoundException("Invalid file path");
+        }
+        return ParcelFileDescriptor.open(new File(fileCanonicalPath), ParcelFileDescriptor.MODE_READ_WRITE);
     }
 }
