@@ -37,7 +37,7 @@
         android:layout_marginEnd="36dp"
         android:layout_marginBottom="36dp"
         android:ems="10"
-        android:inputType="textEmailAddress"
+        android:inputType="textEmailAddress|textNoSuggestions"
         app:layout_constraintBottom_toTopOf="@+id/passwordView"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/welcomeText" />

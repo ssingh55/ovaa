@@ -29,6 +29,8 @@ public class LoginActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_login);
 
+        getWindow().getDecorView().getRootView().setFilterTouchesWhenObscured(true);
+
         loginUtils = LoginUtils.getInstance(this);
         if (loginUtils.isLoggedIn()) {
             onLoginFinished();
