@@ -1,0 +1,114 @@
+# Build the app, upload it to Appknox autofix staging, and let autofix open a PR.
+#
+# Runs appknox-go feat/autofix-cli-gate (the current fix prompt and patch gate)
+# from a throwaway autofix-ci/** branch; the PR it opens is never merged.
+# Ported from the aibom-android workflow, made repo-agnostic: the Gradle JDK is
+# the only per-repo setting, and the release bundle is found after the build
+# rather than assumed, because flavoured apps name it differently.
+name: Appknox Autofix (cli-gate)
+
+on:
+  push:
+    branches:
+      - "autofix-ci/**"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model for the autofix patch turn"
+        required: false
+        default: claude-haiku-4-5-20251001
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  APPKNOX_API_HOST: https://autofix.staging.appknox.io/
+  AUTOFIX_MODEL: ${{ github.event.inputs.model || 'claude-haiku-4-5-20251001' }}
+  # JDK that RUNS Gradle; the ladder below serves exact toolchain requests.
+  GRADLE_JDK: "17"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain JDK ladder
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            8
+            11
+            17
+            18
+            21
+
+      - name: Set up the JDK that runs Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.GRADLE_JDK }}
+
+      - name: Build the release bundle
+        id: build
+        run: |
+          set -o pipefail
+          chmod +x ./gradlew
+          TOOLCHAINS="-Dorg.gradle.java.installations.fromEnv=JAVA_HOME_8_X64,JAVA_HOME_11_X64,JAVA_HOME_17_X64,JAVA_HOME_18_X64,JAVA_HOME_21_X64"
+          ./gradlew --no-daemon $TOOLCHAINS bundleRelease --stacktrace
+          artifact=$(find . -path '*/build/outputs/bundle/*' -iname '*.aab' -ipath '*release*' -print0 \
+            | xargs -0 ls -S 2>/dev/null | head -1)
+          if [ -z "$artifact" ]; then
+            echo "::error::bundleRelease produced no release .aab"
+            find . -path '*/build/outputs/*' -type f | head -20
+            exit 1
+          fi
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "built $artifact"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release.aab
+          path: ${{ steps.build.outputs.artifact }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Checkout appknox-go
+        uses: actions/checkout@v4
+        with:
+          repository: appknox/appknox-go
+          ref: feat/autofix-cli-gate
+          path: appknox-go
+
+      - name: Build appknox CLI
+        working-directory: appknox-go
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+          go build -o "$GITHUB_WORKSPACE/bin/appknox" .
+
+      - name: Upload app and run Appknox cicheck
+        id: appknox_scan
+        continue-on-error: true
+        env:
+          APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_AUTOFIX_TOKEN }}
+        run: |
+          FILE_ID=$(./bin/appknox upload "${{ steps.build.outputs.artifact }}" --knoxiq)
+          echo "Uploaded file id: $FILE_ID"
+          echo "file_id=$FILE_ID" >> "$GITHUB_OUTPUT"
+          ./bin/appknox cicheck "$FILE_ID" --risk-threshold CRITICAL
+
+      - name: Run Appknox autofix
+        if: steps.appknox_scan.outputs.file_id != ''
+        env:
+          APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_AUTOFIX_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./bin/appknox autofix \
+            --file-id "${{ steps.appknox_scan.outputs.file_id }}" \
+            --model "${AUTOFIX_MODEL}"
