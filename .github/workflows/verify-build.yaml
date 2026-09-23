@@ -1,0 +1,294 @@
+# Did the autofix actually fix anything?
+#
+# Compiling proves the patch is valid Kotlin; only a rescan proves the finding
+# cleared. The autofix gate is static -- it reads the patch, it never builds or
+# scans it -- so both answers have to come from outside it.
+#
+# This builds the patched tree, uploads it, and diffs the new scan against the
+# scan the fixes were generated from. It never runs autofix, so a verify run
+# cannot change the thing it is verifying.
+#
+# Set currentFileId to re-compare an already-uploaded file without rebuilding
+# or uploading again (e.g. when a previous run gave up before its scan ended).
+name: Verify build
+
+on:
+  push:
+    branches:
+      - "verify/**"
+  workflow_dispatch:
+    inputs:
+      baselineFileId:
+        description: "Appknox file id the fixes were generated from"
+        required: false
+        default: "57"
+      currentFileId:
+        description: "Already-uploaded file id to compare; skips build + upload when set"
+        required: false
+        default: ""
+
+env:
+  APPKNOX_API_HOST: https://autofix.staging.appknox.io/
+  BASELINE_FILE_ID: ${{ github.event.inputs.baselineFileId || '57' }}
+  CURRENT_FILE_ID: ${{ github.event.inputs.currentFileId || '' }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_AUTOFIX_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.CURRENT_FILE_ID == ''
+
+      - name: Install the toolchain JDK ladder
+        if: env.CURRENT_FILE_ID == ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            8
+            11
+            17
+            18
+            21
+
+      - name: Set up the JDK that runs Gradle
+        if: env.CURRENT_FILE_ID == ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Accept Android SDK licences
+        if: env.CURRENT_FILE_ID == ''
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+
+      - name: Build the patched app
+        id: build
+        if: env.CURRENT_FILE_ID == ''
+        run: |
+          set -o pipefail
+          chmod +x ./gradlew
+          TOOLCHAINS="-Dorg.gradle.java.installations.fromEnv=JAVA_HOME_8_X64,JAVA_HOME_11_X64,JAVA_HOME_17_X64,JAVA_HOME_18_X64,JAVA_HOME_21_X64"
+          ./gradlew --no-daemon $TOOLCHAINS bundleRelease --stacktrace
+          artifact=$(find . -path '*/build/outputs/bundle/*' -iname '*.aab' -ipath '*release*' -print0 \
+            | xargs -0 ls -S 2>/dev/null | head -1)
+          [ -n "$artifact" ] || { echo "::error::bundleRelease produced no release .aab"; exit 1; }
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "built $artifact"
+
+      - name: Set up Go
+        if: env.CURRENT_FILE_ID == ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Checkout appknox-go
+        if: env.CURRENT_FILE_ID == ''
+        uses: actions/checkout@v4
+        with:
+          repository: appknox/appknox-go
+          ref: feat/autofix-cli-gate
+          path: appknox-go
+
+      - name: Build appknox CLI
+        if: env.CURRENT_FILE_ID == ''
+        working-directory: appknox-go
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+          go build -o "$GITHUB_WORKSPACE/bin/appknox" .
+
+      # --knoxiq keeps this symmetric with the baseline upload.
+      - name: Upload the rebuilt app
+        id: upload
+        run: |
+          set -euo pipefail
+          if [ -n "${CURRENT_FILE_ID}" ]; then
+            file_id="${CURRENT_FILE_ID}"
+            echo "re-comparing existing file ${file_id} (no build, no upload)"
+          else
+            file_id=$(./bin/appknox upload "${{ steps.build.outputs.artifact }}" --knoxiq)
+            echo "uploaded as file ${file_id}"
+          fi
+          [[ "${file_id}" =~ ^[0-9]+$ ]] || { echo "::error::file id '${file_id}' is not numeric"; exit 1; }
+          echo "file_id=${file_id}" >> "$GITHUB_OUTPUT"
+
+      # The comparison is only meaningful on a FINISHED static scan: a partial
+      # scan has not re-found everything yet, so missing findings would read as
+      # "cleared". cicheck's own wait exits 1 on the first transient 5xx, which
+      # is why it is not used here. This polls, tolerates transient errors, and
+      # FAILS the job if the scan does not finish -- never compares a partial one.
+      - name: Wait for the static scan to finish
+        timeout-minutes: 50
+        run: |
+          set -uo pipefail
+          file_id="${{ steps.upload.outputs.file_id }}"
+          url="${APPKNOX_API_HOST}api/v3/files/${file_id}/scans_status_summary"
+          deadline=$(( $(date +%s) + 45 * 60 ))
+          errors=0
+          while :; do
+            if body=$(curl -sf --max-time 60 -H "Authorization: Token $APPKNOX_ACCESS_TOKEN" "$url"); then
+              errors=0
+              done_flag=$(echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(int(bool(d.get("is_static_done")) or d.get("static_scan_progress", 0) >= 100))')
+              progress=$(echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("static_scan_progress", 0))')
+              echo "static scan progress: ${progress}%"
+              [ "$done_flag" = "1" ] && { echo "static scan finished"; exit 0; }
+            else
+              errors=$((errors + 1))
+              echo "status check failed (${errors} in a row); retrying"
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::static scan of file ${file_id} did not finish within 45 minutes; refusing to compare a partial scan"
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Did the fixes clear the findings?
+        run: |
+          set -euo pipefail
+          current="${{ steps.upload.outputs.file_id }}"
+          baseline="${BASELINE_FILE_ID}"
+          api() { curl -sf --retry 5 --retry-all-errors --retry-delay 10 -H "Authorization: Token $APPKNOX_ACCESS_TOKEN" "$1"; }
+
+          echo "comparing file $current against baseline $baseline"
+          api "${APPKNOX_API_HOST}api/v2/files/$baseline/analyses?limit=200" > /tmp/baseline.json
+          api "${APPKNOX_API_HOST}api/v2/files/$current/analyses?limit=200"  > /tmp/current.json
+
+          python3 - <<'PY'
+          import json
+
+          def load(path):
+              with open(path) as fh:
+                  return json.load(fh)
+
+          def risky(data):
+              """vulnerability id -> computed risk, for anything above Passed."""
+              return {a["vulnerability"]: a.get("computed_risk", 0)
+                      for a in data.get("results", [])
+                      if a.get("computed_risk", 0) > 0}
+
+          base, cur = load("/tmp/baseline.json"), load("/tmp/current.json")
+          # A scan with fewer analyses than its baseline is incomplete, not fixed.
+          print(f"analyses: baseline {base.get('count')} / current {cur.get('count')}")
+
+          before, after = risky(base), risky(cur)
+          cleared    = sorted(set(before) - set(after))
+          remaining  = sorted(set(before) & set(after))
+          introduced = sorted(set(after) - set(before))
+
+          print(f"baseline risky findings : {len(before)}")
+          print(f"current  risky findings : {len(after)}")
+          print(f"CLEARED                 : {cleared}")
+          print(f"STILL PRESENT           : {remaining}")
+          print(f"NEWLY INTRODUCED        : {introduced}")
+
+          # Reported, never asserted. A finding can persist because the patch
+          # was wrong OR because the flagged code sits in a bundled dependency
+          # the patch cannot reach; this step cannot tell those apart.
+          if introduced:
+              print("NOTE: the rebuild introduced findings the baseline did not have")
+
+          # What the scanner actually says about each finding that survived, so a
+          # patch that landed but did not satisfy the detector can be told apart
+          # from one that never landed. Secret-shaped strings are masked: the
+          # hardcoded-key finding quotes the key itself.
+          import re
+          SECRET = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9_-]{8,}")
+          by_vuln = {a["vulnerability"]: a for a in cur.get("results", [])}
+          for vid in remaining:
+              findings = by_vuln[vid].get("findings") or []
+              print(f"--- still present: vulnerability {vid} ({len(findings)} finding(s))")
+              for f in findings[:5]:
+                  text = SECRET.sub(lambda m: m.group(0)[0] + "****", f.get("description") or "")
+                  print("    " + text.replace("\n", " | ")[:300])
+          PY
+
+      # Before/after report read straight from this host: file metadata, and the
+      # vulnerability name + computed risk per risky analysis. Also written to
+      # the run's summary page so it can be shown without reading logs.
+      - name: Before and after report
+        env:
+          BEFORE_ID: ${{ env.BASELINE_FILE_ID }}
+          AFTER_ID: ${{ steps.upload.outputs.file_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          host = os.environ["APPKNOX_API_HOST"]
+          token = os.environ["APPKNOX_ACCESS_TOKEN"]
+          RISK = {0: "Passed", 1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
+
+          def get(path):
+              req = urllib.request.Request(host + path, headers={"Authorization": "Token " + token})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)
+
+          def risky(fid):
+              res = get(f"api/v2/files/{fid}/analyses?limit=200").get("results", [])
+              return {a["vulnerability"]: a.get("computed_risk", 0) for a in res if a.get("computed_risk", 0) > 0}
+
+          before_id, after_id = os.environ["BEFORE_ID"], os.environ["AFTER_ID"]
+          lines = [f"## ovaa on {host}", ""]
+          for label, fid in (("Before autofix", before_id), ("After autofix", after_id)):
+              f = get(f"api/v2/files/{fid}")
+              lines.append(f"- **{label}:** file {fid} -- {f.get('name')} {f.get('version')} "
+                           f"(code {f.get('version_code')}), uploaded {f.get('created_on')}, "
+                           f"static scan done: {f.get('is_static_done')}")
+          before, after = risky(before_id), risky(after_id)
+          lines += ["", "| ID | Vulnerability | Before | After | Status |", "|---|---|---|---|---|"]
+          for vid in sorted(set(before) | set(after)):
+              name = get(f"api/v2/vulnerabilities/{vid}").get("name", "?")
+              b, a = before.get(vid), after.get(vid)
+              status = "FIXED" if b and not a else ("NEW" if a and not b else "still present")
+              lines.append(f"| {vid} | {name} | {RISK.get(b, '-') if b else '-'} | "
+                           f"{RISK.get(a, '-') if a else 'cleared'} | {status} |")
+          fixed = [v for v in before if v not in after]
+          lines += ["", f"**Risky findings: {len(before)} before -> {len(after)} after "
+                        f"({len(fixed)} fixed, {len(set(after) - set(before))} new)**"]
+
+          # What KnoxIQ said for each risky analysis on the BEFORE file -- the
+          # same endpoint autofix reads (api/knoxiq/analyses/<id>/findings).
+          # "Where" is KnoxIQ's own step headings, i.e. where it says the fix goes.
+          import re
+          SECRET = re.compile(r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9_-]{8,}")
+          mask = lambda s: SECRET.sub(lambda m: m.group(0)[0] + "****", s or "")
+          one_line = lambda s, n: mask(s).replace("\n", " ").strip()[:n]
+
+          def fixable(v):
+              if not v:
+                  return False, "no validation"
+              if v.get("is_valid") is False:
+                  return False, "invalid"
+              if v.get("verdict") == "FALSE_POSITIVE":
+                  return False, "false positive"
+              if v.get("is_third_party") is True:
+                  return False, "third-party code"
+              return True, "fixable"
+
+          analyses = get(f"api/v2/files/{before_id}/analyses?limit=200").get("results", [])
+          lines += ["", "## KnoxIQ remediation (before file)", ""]
+          for a in sorted((a for a in analyses if a.get("computed_risk", 0) > 0), key=lambda a: a["vulnerability"]):
+              vid = a["vulnerability"]
+              status = "FIXED" if vid in fixed else "still present"
+              findings = get(f"api/knoxiq/analyses/{a['id']}/findings?limit=100").get("results", [])
+              lines.append(f"### {vid} {get(f'api/v2/vulnerabilities/{vid}').get('name', '?')} -- {status}")
+              if not findings:
+                  lines += ["- KnoxIQ: no findings recorded for this analysis", ""]
+                  continue
+              for f in findings:
+                  ok, why = fixable(f.get("validation"))
+                  rem = f.get("remediation") or {}
+                  lines.append(f"- KnoxIQ verdict: **{why}**" + ("" if ok else " (autofix skips it)"))
+                  lines.append(f"  - Summary: {one_line(rem.get('remediation') or f.get('description'), 260)}")
+                  for step in (rem.get("steps") or [])[:4]:
+                      head = step.split(":", 1)[0] if ":" in step[:120] else step
+                      lines.append(f"  - Where: {one_line(head, 140)}")
+              lines.append("")
+          report = "\n".join(lines)
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(report + "\n")
+          PY
