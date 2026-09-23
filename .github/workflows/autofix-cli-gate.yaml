@@ -52,6 +52,10 @@ jobs:
           distribution: temurin
           java-version: ${{ env.GRADLE_JDK }}
 
+      # The runner's SDK has not accepted the NDK licence ovaa's AGP asks for.
+      - name: Accept Android SDK licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+
       - name: Build the release bundle
         id: build
         run: |
