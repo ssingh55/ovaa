@@ -44,6 +44,7 @@ public class MainActivity extends AppCompatActivity {
             public void onClick(View view) {
                 Intent i = new Intent("oversecured.ovaa.action.UNPROTECTED_CREDENTIALS_DATA");
                 i.putExtra("payload", MainActivity.this.loginUtils.getLoginData());
+                i.setPackage(MainActivity.this.getPackageName());
                 sendBroadcast(i);
             }
         });
